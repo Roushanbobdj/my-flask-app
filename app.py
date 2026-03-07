@@ -1,9 +1,11 @@
+import cloudinary
+import cloudinary.uploader
 import logging
 logging.basicConfig(level=logging.INFO)
 from flask import Flask, render_template, redirect, url_for, request, flash, jsonify
-from werkzeug.utils import secure_filename
 import pandas as pd
 from flask import send_file
+from flask import session
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.exc import IntegrityError
 from flask_login import (
@@ -15,42 +17,50 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
 import qrcode
 import os
+cloudinary.config(
+    cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.environ.get("CLOUDINARY_API_KEY"),
+    api_secret=os.environ.get("CLOUDINARY_API_SECRET"),
+    secure=True
+)
 import uuid
-from PIL import Image
 
-UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), "static", "uploads")
-MAX_IMAGE_SIZE_KB = 200
-
-
-def save_and_compress_image(file, filename):
-    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-    try:
-        image = Image.open(file).convert("RGB")
-    except Exception:
-        raise ValueError("Invalid image file")
-
-    # 🔹 resize (max 800x800)
-    image.thumbnail((800, 800))
-
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
-
-    quality = 85
-    while True:
-        image.save(filepath, format="JPEG", quality=quality, optimize=True)
-        if os.path.getsize(filepath) / 1024 <= MAX_IMAGE_SIZE_KB or quality <= 30:
-            break
-        quality -= 5
-
-    return filename
 # -------------------------
 # APP CONFIG
 # -------------------------
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get("SECRET_KEY","dev-secret")
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///library.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+database_url = os.environ.get("DATABASE_URL")
+
+if not database_url:
+    # fallback for local dev
+    database_url = "sqlite:///local.db"
+
+if database_url.startswith("postgres://"):
+    database_url = database_url.replace(
+        "postgres://", "postgresql://", 1
+    )
+
+app.config["SQLALCHEMY_DATABASE_URI"] = database_url
+
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=365)
+
+app.config['REMEMBER_COOKIE_NAME'] = "remember_token"
+app.config['REMEMBER_COOKIE_DURATION'] = timedelta(days=365)
+app.config['REMEMBER_COOKIE_SECURE'] = True
+app.config['REMEMBER_COOKIE_HTTPONLY'] = True
+
+app.config['SESSION_COOKIE_SAMESITE'] = "None"
+app.config['SESSION_COOKIE_SECURE'] = True
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_NAME'] = "myapp_session"
+
+app.config['SESSION_REFRESH_EACH_REQUEST'] = False
+app.config['REMEMBER_COOKIE_REFRESH_EACH_REQUEST'] = False
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config['REMEMBER_COOKIE_SAMESITE'] = "None"
 
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
@@ -143,12 +153,11 @@ class SocialLink(db.Model):
     icon = db.Column(db.String(50))      # emoji ya icon class
     url = db.Column(db.String(300))      # link
     is_active = db.Column(db.Boolean, default=True)
-
     
 # -------------------------
 # LOGIN MANAGER
 # -------------------------
-
+    
 @login_manager.user_loader
 def load_user(user_id):
     return Student.query.get(int(user_id))
@@ -186,12 +195,27 @@ def get_student_fee_summary(student_id):
         )
 
     return total_paid, last_payment
+    
+def upload_image_to_cloudinary(file):
+    result = cloudinary.uploader.upload(
+        file,
+        folder="students",
+        resource_type="image",
+        transformation=[
+            {"width": 800, "height": 800, "crop": "limit"},
+            {"quality": "auto"},
+            {"fetch_format": "auto"}
+        ]
+    )
+    return result["secure_url"]
 # -------------------------
 # AUTH ROUTES
 # -------------------------
 
 @app.route("/")
 def home():
+    if current_user.is_authenticated:
+        return redirect(url_for(f"{current_user.role}_dashboard"))
     return redirect(url_for("login"))
 
 @app.route("/login", methods=["GET", "POST"])
@@ -204,7 +228,13 @@ def login():
             if not user.is_active:
                 flash("Your account is blocked by admin")
                 return redirect(url_for("login"))
-            login_user(user)
+
+            login_user(
+                user,
+                remember=True,
+                duration=timedelta(days=365)
+            )
+            
             return redirect(url_for(f"{user.role}_dashboard"))
         flash("Invalid Credentials")
     return render_template("login.html")
@@ -213,6 +243,7 @@ def login():
 @login_required
 def logout():
     logout_user()
+    session.pop('_flashes', None)
     return redirect(url_for("login"))
 
 # -------------------------
@@ -251,13 +282,11 @@ def admin_register():
                 return redirect(url_for("admin_register"))
 
         # 📸 PHOTO UPLOAD + COMPRESS (FIXED)
-        photo_filename = None
+        photo_url = None
         photo = request.files.get("photo")
 
         if photo and photo.filename:
-            ext = photo.filename.rsplit(".", 1)[-1].lower()
-            unique_name = f"{uuid.uuid4().hex}.{ext}"
-            photo_filename = save_and_compress_image(photo, unique_name)
+            photo_url = upload_image_to_cloudinary(photo)
 
         # ✅ CREATE STUDENT (OLD CODE SAFE)
         student = Student(
@@ -272,7 +301,7 @@ def admin_register():
             timing_to=request.form.get("timing_to"),
             monthly_fee=int(request.form.get("monthly_fee") or 0),
             seat_number=request.form.get("seat_number") or "",
-            photo=photo_filename
+            photo=photo_url
         )
 
         try:
@@ -301,6 +330,10 @@ def inject_unread_count():
         count = Ticket.query.filter_by(is_read=False).count()
         return dict(unread_count=count)
     return dict(unread_count=0)
+
+@app.before_request
+def make_session_permanent():
+    session.permanent = True
 # -------------------------
 # ADMIN EDIT STUDENT PROFILE
 # -------------------------
@@ -653,6 +686,15 @@ def toggle_student(id):
     db.session.commit()
     return redirect(url_for("manage_students"))
 
+@app.route("/admin/delete_student/<int:id>")
+@login_required
+def delete_student(id):
+    if current_user.role != "admin":
+        return redirect(url_for("admin_dashboard"))
+    student = Student.query.get_or_404(id)
+    db.session.delete(student)
+    db.session.commit()
+    return redirect(url_for("manage_students"))
 
 @app.route("/admin/reset_password/<int:id>", methods=["GET","POST"])
 @login_required
@@ -787,9 +829,7 @@ def admin_view_student_profile(student_id):
         # photo update
         photo = request.files.get("photo")
         if photo and photo.filename:
-            filename = f"{student.admission_number}.jpg"
-            filename = save_and_compress_image(photo, filename)
-            student.photo = filename
+            student.photo = upload_image_to_cloudinary(photo)
 
         db.session.commit()
         flash("Student profile updated successfully")
@@ -975,14 +1015,9 @@ def profile():
 
             # 🔴 ADD: OLD PHOTO DELETE (AUTO CLEAN)
             if student.photo:
-                old_path = os.path.join(UPLOAD_FOLDER, student.photo)
-                if os.path.exists(old_path):
-                    os.remove(old_path)
-
-            # 🔵 EXISTING + SAFE
-            filename = f"{student.admission_number}.jpg"
-            filename = save_and_compress_image(photo, filename)
-            student.photo = filename
+                photo = request.files.get("photo")
+                if photo and photo.filename:
+                    student.photo = upload_image_to_cloudinary(photo)
 
         # 🔐 ADMIN EXTRA CONTROLS (UNCHANGED)
         if current_user.role == "admin":
@@ -1007,38 +1042,6 @@ def profile():
         last_payment=last_payment,
         admin_view=False
     )
-
-@app.route("/admin/delete_student/<int:id>", methods=["POST"])
-@login_required
-def delete_student(id):
-
-    if current_user.role != "admin":
-        flash("Unauthorized access", "danger")
-        return redirect(url_for("login"))
-
-    student = Student.query.get_or_404(id)
-
-    # 🗑 DELETE PHOTO FILE
-    if student.photo:
-        photo_path = os.path.join(UPLOAD_FOLDER, student.photo)
-        if os.path.exists(photo_path):
-            os.remove(photo_path)
-
-    # 🗑 DELETE ATTENDANCE
-    Attendance.query.filter_by(student_id=student.id).delete()
-
-    # 🗑 DELETE NOTIFICATIONS
-    Notification.query.filter_by(student_id=student.id).delete()
-
-    # 🗑 DELETE SUPPORT TICKETS
-    Ticket.query.filter_by(student_id=student.id).delete()
-
-    # 🗑 DELETE STUDENT
-    db.session.delete(student)
-    db.session.commit()
-
-    flash("✅ Student and all related data deleted", "success")
-    return redirect(url_for("manage_students"))
 
 @app.route("/add-expense", methods=["GET", "POST"])
 @login_required
@@ -1133,7 +1136,6 @@ def manage_social_links():
 
     links = SocialLink.query.all()
     return render_template("admin_social_links.html", links=links)
-
 @app.route("/admin/clear-bell", methods=["POST"])
 @login_required
 def clear_bell():
@@ -1141,11 +1143,6 @@ def clear_bell():
         .update({Ticket.is_read: True})
     db.session.commit()
     return "", 204
-
-# =========================
-# ADMIN SEAT RESERVATION
-# =========================
-
 @app.route("/admin/seats")
 @login_required
 def admin_seats():
@@ -1164,12 +1161,20 @@ def admin_seats():
         "admin_seats.html",
         students=students
     )
+
 # -------------------------
-# RUN APP
+# DB INIT (FIRST DEPLOY ONLY)
 # -------------------------
-if __name__ == "__main__":
-    with app.app_context():
+with app.app_context():
         db.create_all()
         create_default_admin()
 
-    app.run(debug=True, use_reloader=False)  
+
+# -------------------------
+# RUN APP
+# -------------------------
+import os
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
